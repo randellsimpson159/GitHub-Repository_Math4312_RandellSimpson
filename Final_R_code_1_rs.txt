@@ -1,0 +1,630 @@
+library(shiny)
+library(ggplot2)
+library(rlang)
+library(dplyr)
+
+# ------------------------------------------
+# 1. Safe mathematical expression evaluation
+# ------------------------------------------
+
+allowed_functions <- c(
+  "sin", "cos", "tan", "asin", "acos", "atan",
+  "sinh", "cosh", "tanh",
+  "log", "log2", "log10", "exp",
+  "sqrt", "abs", "sign",
+  "pi"
+)
+
+allowed_operators <- c("+", "-", "*", "/", "^", "(", ")")
+
+# check that an expression contains only x,
+# constants, approved operators, and approved functions.
+is_safe_expression <- function(expr) {
+  
+  if (is.symbol(expr)) {
+    return(as.character(expr) %in% c("x", "pi"))
+  }
+  
+  if (is.atomic(expr)) {
+    return(is.numeric(expr))
+  }
+  
+  if (is.call(expr)) {
+    fn_name <- as.character(expr[[1]])
+    
+    if (length(fn_name) != 1) {
+      return(FALSE)
+    }
+    
+    if (!fn_name %in% allowed_functions &&
+        !fn_name %in% c("+", "-", "*", "/", "^", "(")) {
+      return(FALSE)
+    }
+    
+    return(all(vapply(expr[-1], is_safe_expression, logical(1))))
+  }
+  
+  FALSE
+}
+
+# Convert user notation into R syntax:
+# 2x -> 2*x, x^2 stays x^2, etc.
+clean_function_input <- function(text) {
+  text <- trimws(text)
+  text <- gsub("\\s+", "", text)
+  
+  # Insert multiplication between a number and x:
+  # 2x -> 2*x, 3x^2 -> 3*x^2
+  text <- gsub("([0-9])x", "\\1*x", text)
+  
+  # Insert multiplication between ) and x, or x and (
+  text <- gsub("\\)x", ")*x", text)
+  text <- gsub("x\\(", "x*(", text)
+  
+  text
+}
+
+# Build an safe R function from user text
+make_function <- function(user_text) {
+  
+  cleaned <- clean_function_input(user_text)
+  
+  parsed <- tryCatch(
+    parse(text = cleaned)[[1]],
+    error = function(e) NULL
+  )
+  
+  if (is.null(parsed)) {
+    return(list(
+      ok = FALSE,
+      message = "Could not read the expression. Please use valid R-style math syntax.",
+      f = NULL,
+      cleaned = cleaned
+    ))
+  }
+  
+  if (!is_safe_expression(parsed)) {
+    return(list(
+      ok = FALSE,
+      message = paste(
+        "Only x, numbers, +, -, *, /, ^, parentheses, and standard",
+        "math functions such as sin(), cos(), exp(), log(), and sqrt() are allowed."
+      ),
+      f = NULL,
+      cleaned = cleaned
+    ))
+  }
+  
+  f <- tryCatch(
+    function(x) eval(parsed, envir = list(x = x, pi = pi)),
+    error = function(e) NULL
+  )
+  
+  if (is.null(f)) {
+    return(list(
+      ok = FALSE,
+      message = "The expression could not be converted into a function.",
+      f = NULL,
+      cleaned = cleaned
+    ))
+  }
+  
+  # Test if the function returns valid output
+  test_values <- c(-2, -1, -0.5, 0.5, 1, 2)
+  test_results <- tryCatch(
+    vapply(test_values, function(xx) {
+      y <- f(xx)
+      ifelse(is.finite(y), y, NA_real_)
+    }, numeric(1)),
+    error = function(e) rep(NA_real_, length(test_values))
+  )
+  
+  if (all(is.na(test_results))) {
+    return(list(
+      ok = FALSE,
+      message = "The expression is valid R syntax, but it did not produce real numeric values on the selected interval.",
+      f = NULL,
+      cleaned = cleaned
+    ))
+  }
+  
+  list(
+    ok = TRUE,
+    message = "Valid function expression.",
+    f = f,
+    cleaned = cleaned
+  )
+}
+
+# -------------------------------
+# 2. Function-type classification
+# -------------------------------
+
+classify_function <- function(user_text) {
+  
+  text <- tolower(clean_function_input(user_text))
+  
+  has <- function(pattern) grepl(pattern, text)
+  
+  if (has("sin|cos|tan|asin|acos|atan")) {
+    return("Trigonometric function")
+  }
+  
+  if (has("log|exp")) {
+    return("Exponential or logarithmic function")
+  }
+  
+  if (has("sqrt")) {
+    return("Root function")
+  }
+  
+  if (has("/")) {
+    return("Rational or quotient-based function")
+  }
+  
+  if (has("\\^")) {
+    return("Power or polynomial-type function")
+  }
+  
+  if (has("\\*x|x\\*|[0-9]x")) {
+    return("Likely linear function")
+  }
+  
+  if (grepl("^x$", text)) {
+    return("Linear function")
+  }
+  
+  if (grepl("^[0-9.]+$", text)) {
+    return("Constant function")
+  }
+  
+  "General mathematical function"
+}
+
+# --------------------------------------
+# 3. Numerical calculus and optimization
+# --------------------------------------
+
+numerical_derivative <- function(f, x, h = 1e-5) {
+  (f(x + h) - f(x - h)) / (2 * h)
+}
+
+find_critical_points <- function(f, lower, upper, n_points = 1000) {
+  
+  grid_x <- seq(lower, upper, length.out = n_points)
+  grid_d <- tryCatch(
+    vapply(grid_x, function(xx) numerical_derivative(f, xx), numeric(1)),
+    error = function(e) rep(NA_real_, length(grid_x))
+  )
+  
+  valid <- is.finite(grid_d)
+  grid_x <- grid_x[valid]
+  grid_d <- grid_d[valid]
+  
+  if (length(grid_x) < 3) {
+    return(data.frame(x = numeric(), type = character()))
+  }
+  
+  sign_change <- grid_d[1:(length(grid_d) - 1)] *
+    grid_d[2:length(grid_d)] < 0
+  
+  candidate_intervals <- cbind(
+    grid_x[1:(length(grid_x) - 1)][sign_change],
+    grid_x[2:length(grid_x)][sign_change]
+  )
+  
+  critical_points <- apply(candidate_intervals, 1, function(interval) {
+    tryCatch({
+      root <- uniroot(
+        function(xx) numerical_derivative(f, xx),
+        interval = interval,
+        tol = 1e-8
+      )$root
+      
+      second_derivative <- numerical_derivative(
+        function(yy) numerical_derivative(f, yy),
+        root
+      )
+      
+      if (second_derivative < -1e-6) {
+        type <- "Local maximum"
+      } else if (second_derivative > 1e-6) {
+        type <- "Local minimum"
+      } else {
+        type <- "Possible inflection or flat critical point"
+      }
+      
+      data.frame(x = root, type = type)
+    }, error = function(e) NULL)
+  })
+  
+  critical_points <- bind_rows(critical_points)
+  
+  if (nrow(critical_points) == 0) {
+    data.frame(x = numeric(), type = character())
+  } else {
+    critical_points %>%
+      arrange(x) %>%
+      distinct(x, .keep_all = TRUE)
+  }
+}
+
+find_global_extrema <- function(f, lower, upper, n_points = 2000) {
+  
+  grid_x <- seq(lower, upper, length.out = n_points)
+  grid_y <- tryCatch(
+    vapply(grid_x, function(xx) {
+      y <- f(xx)
+      ifelse(is.finite(y), y, NA_real_)
+    }, numeric(1)),
+    error = function(e) rep(NA_real_, length(grid_x))
+  )
+  
+  if (all(is.na(grid_y))) {
+    return(list(min = NULL, max = NULL))
+  }
+  
+  min_index <- which.min(grid_y)
+  max_index <- which.max(grid_y)
+  
+  list(
+    min = data.frame(x = grid_x[min_index], y = grid_y[min_index]),
+    max = data.frame(x = grid_x[max_index], y = grid_y[max_index])
+  )
+}
+
+# -----------------
+# 4. User Interface
+# -----------------
+
+ui <- fluidPage(
+  
+  titlePanel("Function Explorer"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      width = 4,
+      
+      h3("Give an example of a function"),
+      
+      textInput(
+        inputId = "function_answer",
+        label = "Enter a function of x, then click Analyze Function:",
+        placeholder = "Examples: x^2, sin(x), 2*x + 3, 1/x, exp(x)"
+      ),
+      
+      actionButton(
+        inputId = "add_function",
+        label = "Analyze function",
+        class = "btn-primary"
+      ),
+      
+      hr(),
+      
+      sliderInput(
+        inputId = "x_range",
+        label = "Select x-axis interval:",
+        min = -10,
+        max = 10,
+        value = c(-5, 5),
+        step = 0.5
+      ),
+      
+      hr(),
+      
+      h4("Accepted input examples"),
+      p("x^2"),
+      p("2*x + 3"),
+      p("sin(x)"),
+      p("cos(x) + x"),
+      p("1/x"),
+      p("exp(x)"),
+      p("log(x)"),
+      p("sqrt(x)"),
+      p("x^3 - 3*x")
+    ),
+    
+    mainPanel(
+      width = 8,
+      
+      tabsetPanel(
+        
+        tabPanel(
+          "Analysis",
+          
+          h4("Your input"),
+          verbatimTextOutput("original_input"),
+          
+          h4("Validity and classification"),
+          verbatimTextOutput("function_feedback"),
+          
+          h4("Mathematical properties"),
+          verbatimTextOutput("calculus_summary"),
+          
+          h4("Function graph"),
+          plotOutput("function_plot", height = "420px")
+        ),
+        
+        tabPanel(
+          "Derivative Analysis",
+          
+          h4("First derivative"),
+          p("The derivative is estimated numerically using a central difference formula."),
+          
+          plotOutput("derivative_plot", height = "420px"),
+          
+          h4("Critical points"),
+          verbatimTextOutput("critical_points")
+        ),
+        
+        tabPanel(
+          "Function History",
+          
+          h4("Functions entered during this session"),
+          uiOutput("function_list")
+        )
+      )
+    )
+  )
+)
+
+# ---------------
+# 5. Server logic
+# ---------------
+
+server <- function(input, output, session) {
+  
+  functions_entered <- reactiveVal(character())
+  
+  # Store the most recent valid function
+  current_function <- reactiveVal(NULL)
+  
+  observeEvent(input$add_function, {
+    
+    user_text <- trimws(input$function_answer)
+    
+    if (user_text == "") {
+      current_function(NULL)
+      output$function_feedback <- renderText(
+        "Please enter a function before Analyze Function."
+      )
+      return()
+    }
+    
+    result <- make_function(user_text)
+    
+    if (!result$ok) {
+      current_function(NULL)
+      output$function_feedback <- renderText(result$message)
+      return()
+    }
+    
+    current_function(list(
+      original = user_text,
+      cleaned = result$cleaned,
+      f = result$f,
+      type = classify_function(user_text)
+    ))
+    
+    # Keep a session history, as in the original app
+    functions_entered(c(functions_entered(), user_text))
+    
+    # Clear input after successful submission
+    updateTextInput(session, "function_answer", value = "")
+  })
+  
+  # Show exact original input
+  output$original_input <- renderText({
+    req(current_function())
+    current_function()$original
+  })
+  
+  # Validity & function-type feedback
+  output$function_feedback <- renderText({
+    req(current_function())
+    
+    current <- current_function()
+    
+    paste0(
+      "Valid function: Yes\n",
+      "Interpreted expression: ", current$cleaned, "\n",
+      "Detected function type: ", current$type, "\n",
+      "Analysis interval: [", input$x_range[1], ", ", input$x_range[2], "]"
+    )
+  })
+  
+  # Mathsummaryf
+  output$calculus_summary <- renderText({
+    req(current_function())
+    
+    current <- current_function()
+    lower <- input$x_range[1]
+    upper <- input$x_range[2]
+    
+    extrema <- find_global_extrema(current$f, lower, upper)
+    critical <- find_critical_points(current$f, lower, upper)
+    
+    critical_text <- if (nrow(critical) == 0) {
+      "No critical points were detected on this interval."
+    } else {
+      paste0(
+        "Critical points:\n",
+        paste0(
+          "  x = ", round(critical$x, 4),
+          " | f(x) = ", round(current$f(critical$x), 4),
+          " | ", critical$type,
+          collapse = "\n"
+        )
+      )
+    }
+    
+    min_text <- if (!is.null(extrema$min)) {
+      paste0(
+        "Approximate global minimum on interval: x = ",
+        round(extrema$min$x, 4),
+        ", f(x) = ",
+        round(extrema$min$y, 4)
+      )
+    } else {
+      "No finite global minimum found on this interval."
+    }
+    
+    max_text <- if (!is.null(extrema$max)) {
+      paste0(
+        "Approximate global maximum on interval: x = ",
+        round(extrema$max$x, 4),
+        ", f(x) = ",
+        round(extrema$max$y, 4)
+      )
+    } else {
+      "No finite global maximum found on this interval."
+    }
+    
+    paste0(
+      critical_text,
+      "\n\n",
+      min_text,
+      "\n",
+      max_text
+    )
+  })
+  
+  # Function plot
+  output$function_plot <- renderPlot({
+    req(current_function())
+    
+    current <- current_function()
+    lower <- input$x_range[1]
+    upper <- input$x_range[2]
+    
+    grid_x <- seq(lower, upper, length.out = 1000)
+    grid_y <- vapply(grid_x, function(xx) {
+      y <- current$f(xx)
+      ifelse(is.finite(y), y, NA_real_)
+    }, numeric(1))
+    
+    plot_data <- data.frame(x = grid_x, y = grid_y)
+    
+    critical <- find_critical_points(current$f, lower, upper)
+    
+    if (nrow(critical) > 0) {
+      critical$y <- vapply(critical$x, function(xx) {
+        y <- current$f(xx)
+        ifelse(is.finite(y), y, NA_real_)
+      }, numeric(1))
+    }
+    
+    ggplot(plot_data, aes(x = x, y = y)) +
+      geom_line(color = "#2C7FB8", linewidth = 1.1, na.rm = TRUE) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+      {if (nrow(critical) > 0)
+        geom_point(
+          data = critical,
+          aes(x = x, y = y, color = type),
+          size = 3
+        )} +
+      {if (nrow(critical) > 0)
+        scale_color_manual(
+          values = c(
+            "Local maximum" = "#D7301F",
+            "Local minimum" = "#1B7837",
+            "Possible inflection or flat critical point" = "#7F3F98"
+          )
+        )} +
+      labs(
+        title = paste("Graph of f(x) =", current$cleaned),
+        subtitle = "Blue points mark detected critical points.",
+        x = "x",
+        y = "f(x)",
+        color = "Critical point type"
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        legend.position = "bottom"
+      )
+  })
+  
+  # Derivative plot
+  output$derivative_plot <- renderPlot({
+    req(current_function())
+    
+    current <- current_function()
+    lower <- input$x_range[1]
+    upper <- input$x_range[2]
+    
+    grid_x <- seq(lower, upper, length.out = 1000)
+    grid_d <- vapply(grid_x, function(xx) {
+      d <- numerical_derivative(current$f, xx)
+      ifelse(is.finite(d), d, NA_real_)
+    }, numeric(1))
+    
+    derivative_data <- data.frame(x = grid_x, derivative = grid_d)
+    
+    critical <- find_critical_points(current$f, lower, upper)
+    
+    ggplot(derivative_data, aes(x = x, y = derivative)) +
+      geom_line(color = "#D7301F", linewidth = 1.1, na.rm = TRUE) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+      {if (nrow(critical) > 0)
+        geom_vline(
+          xintercept = critical$x,
+          linetype = "dotted",
+          color = "#1B7837"
+        )} +
+      labs(
+        title = paste("Numerical derivative of f(x) =", current$cleaned),
+        subtitle = "Green dotted lines show approximate critical points where f'(x) is near zero.",
+        x = "x",
+        y = "f'(x)"
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(plot.title = element_text(face = "bold"))
+  })
+  
+  # Critical points table
+  output$critical_points <- renderText({
+    req(current_function())
+    
+    current <- current_function()
+    lower <- input$x_range[1]
+    upper <- input$x_range[2]
+    
+    critical <- find_critical_points(current$f, lower, upper)
+    
+    if (nrow(critical) == 0) {
+      return("No critical points were detected on the selected interval.")
+    }
+    
+    critical$y <- vapply(critical$x, function(xx) {
+      y <- current$f(xx)
+      ifelse(is.finite(y), y, NA_real_)
+    }, numeric(1))
+    
+    paste0(
+      "Approximate critical points:\n\n",
+      paste0(
+        "x = ", round(critical$x, 4),
+        " | f(x) = ", round(critical$y, 4),
+        " | ", critical$type,
+        collapse = "\n"
+      )
+    )
+  })
+  
+  # Display previously entered functions
+  output$function_list <- renderUI({
+    
+    if (length(functions_entered()) == 0) {
+      return(p("No function has been analyzed yet."))
+    }
+    
+    tags$ul(
+      lapply(functions_entered(), tags$li)
+    )
+  })
+}
+
+# Run the app
+shinyApp(ui = ui, server = server)
