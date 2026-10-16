@@ -1,0 +1,193 @@
+library(shiny)
+
+ui <- fluidPage(
+    titlePanel("Visualizing Differentiability with Secant Line and Tangents Estimates"),
+    
+    sidebarLayout(
+        sidebarPanel(
+            selectInput(
+                "fun_choice",
+                "Choose a function:",
+                choices = c(
+                    "|x|" = "abs",
+                    "x^2" = "smooth",
+                    "cube root of x" = "vertical",
+                    "|x - 1|" = "corner",
+                    "piecewise step function" = "jump"
+                )
+            ),
+            
+            sliderInput(
+                "x_range",
+                "Displayed x-range:",
+                min = -5, max = 5, value = c(-3, 3), step = 0.5
+            ),
+            
+            sliderInput(
+                "a",
+                "Point a:",
+                min = -3, max = 3, value = 0, step = 0.1
+            ),
+            
+            sliderInput(
+                "h",
+                "Increment h:",
+                min = 0.01, max = 1, value = 0.20, step = 0.01
+            ),
+            
+            checkboxInput("show_secant", "Show secant line", TRUE),
+            checkboxInput("show_tangent", "Show tangent-line estimate", TRUE)
+        ),
+        
+        mainPanel(
+            tabsetPanel(
+                tabPanel(
+                    "Explore",
+                    plotOutput("function_plot", height = "500px"),
+                    h3("Numerical diagnostics"),
+                    verbatimTextOutput("diagnostics")
+                ),
+                
+                tabPanel(
+                    "Theory",
+                    p(
+                        "The derivative describes the change of a function's output with respect to its input (a in this case)",
+                        "The derivative of a function at a chosen input value (a) is the slope of the tangent line of the function at that point.",
+                        "A secant line intersects a curve at two distinct points on a graph.",
+                        "The secant line’s slope estimates the average rate of change over a small interval.",
+                        "As the value of h becomes smaller, the slope of the secant lines reveal if they approach one common value or not.",
+                        "The shared value is the tangent slope and derivative at a.",
+                        "A smooth curve such as x^2 has matching one-sided slopes everywhere.",
+                        "A corner, like at the origin of the absolute value function, the left and right slopes are not the same.",
+                        "With a jump, like in the piecewise function the continuity fails.",
+                        "So then differentiability also fails."
+                    )
+                )
+            )
+        )
+    )
+)
+
+server <- function(input, output, session) {
+    
+    chosen_function <- reactive({
+        switch(
+            input$fun_choice,
+            "abs" = function(x) abs(x),
+            "smooth" = function(x) x^2,
+            "vertical" = function(x) sign(x) * abs(x)^(1 / 3),
+            "corner" = function(x) abs(x - 1),
+            "jump" = function(x) ifelse(x < 0, -1, 1)
+        )
+    })
+    
+    values <- reactive({
+        f <- chosen_function()
+        a <- input$a
+        h <- input$h
+        
+        fa_minus_h <- f(a - h)
+        fa <- f(a)
+        fa_plus_h <- f(a + h)
+        
+        left_slope <- (fa - fa_minus_h) / h
+        right_slope <- (fa_plus_h - fa) / h
+        centered_slope <- (fa_plus_h - fa_minus_h) / (2 * h)
+        
+        list(
+            f = f,
+            a = a,
+            h = h,
+            fa = fa,
+            fa_plus_h = fa_plus_h,
+            left = left_slope,
+            right = right_slope,
+            tangent = centered_slope
+        )
+    })
+    
+    output$function_plot <- renderPlot({
+        d <- values()
+        f <- d$f
+        x <- seq(input$x_range[1], input$x_range[2], length.out = 1000)
+        y <- f(x)
+        
+        plot(
+            x, y,
+            type = "l",
+            lwd = 3,
+            col = "navy",
+            xlab = "x",
+            ylab = "f(x)",
+            main = "Function with Local Slope Estimates"
+        )
+        
+        abline(h = 0, v = 0, col = "gray80", lty = 2)
+        
+        points(d$a, d$fa, pch = 19, col = "black", cex = 1.3)
+        text(d$a, d$fa, labels = "  a", pos = 4)
+        
+        if (input$show_secant) {
+            secant_slope <- (d$fa_plus_h - d$fa) / d$h
+            secant_intercept <- d$fa - secant_slope * d$a
+            
+            abline(
+                a = secant_intercept,
+                b = secant_slope,
+                col = "red",
+                lwd = 2,
+                lty = 2
+            )
+            
+            points(d$a + d$h, d$fa_plus_h, pch = 19, col = "red")
+        }
+        
+        if (input$show_tangent && is.finite(d$tangent)) {
+            tangent_intercept <- d$fa - d$tangent * d$a
+            
+            abline(
+                a = tangent_intercept,
+                b = d$tangent,
+                col = "darkgreen",
+                lwd = 2
+            )
+        }
+        
+        legend(
+            "topleft",
+            legend = c("Function", "Point a", "Secant line", "Tangent estimate"),
+            col = c("navy", "black", "red", "darkgreen"),
+            lty = c(1, NA, 2, 1),
+            pch = c(NA, 19, NA, NA),
+            lwd = c(3, NA, 2, 2),
+            bty = "n"
+        )
+    })
+    
+    output$diagnostics <- renderText({
+        d <- values()
+        
+        tolerance <- 0.05
+        matching_slopes <- is.finite(d$left) &&
+            is.finite(d$right) &&
+            abs(d$left - d$right) < tolerance
+        
+        conclusion <- if (matching_slopes) {
+            "likely differentiable at a"
+        } else {
+            "likely not differentiable at a"
+        }
+        
+        paste0(
+            "a = ", round(d$a, 4), "\n",
+            "h = ", round(d$h, 4), "\n\n",
+            "f(a) = ", round(d$fa, 6), "\n\n",
+            "Left derivative estimate = ", round(d$left, 6), "\n",
+            "Right derivative estimate = ", round(d$right, 6), "\n",
+            "Tangent slope estimate = ", round(d$tangent, 6), "\n\n",
+            "Conclusion: ", conclusion
+        )
+    })
+}
+
+shinyApp(ui, server)
